@@ -411,6 +411,7 @@ typedef struct CXLDCD_Region {
     uint64_t block_size;
     uint32_t dsmadhandle;
     uint8_t flags;
+    unsigned long *blk_bitmap;
 } CXLDCD_Region;
 
 struct CXLType3Dev {

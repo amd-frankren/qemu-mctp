@@ -787,11 +787,35 @@ static int cxl_create_dc_regions(CXLType3Dev *ct3d)
         /* dsmad_handle is set when creating cdat table entries */
         region->flags = 0;
 
+        region->blk_bitmap = bitmap_new(region->len / region->block_size);
+        if (!region->blk_bitmap) {
+            break;
+        }
+
         region_base += region->len;
     }
+
+    if (i < ct3d->dc.num_regions) {
+        while (--i >= 0) {
+            g_free(ct3d->dc.regions[i].blk_bitmap);
+        }
+        return -1;
+    }
+
     QTAILQ_INIT(&ct3d->dc.extents);
 
     return 0;
+}
+
+static void cxl_destroy_dc_regions(CXLType3Dev *ct3d)
+{
+    int i;
+    struct CXLDCD_Region *region;
+
+    for (i = 0; i < ct3d->dc.num_regions; i++) {
+        region = &ct3d->dc.regions[i];
+        g_free(region->blk_bitmap);
+    }
 }
 
 static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
@@ -1021,6 +1045,7 @@ err_free_special_ops:
     g_free(regs->special_ops);
 err_address_space_free:
     if (ct3d->dc.host_dc) {
+        cxl_destroy_dc_regions(ct3d);
         address_space_destroy(&ct3d->dc.host_dc_as);
     }
     if (ct3d->hostpmem) {
@@ -1043,6 +1068,7 @@ static void ct3_exit(PCIDevice *pci_dev)
     spdm_sock_fini(ct3d->doe_spdm.socket);
     g_free(regs->special_ops);
     if (ct3d->dc.host_dc) {
+        cxl_destroy_dc_regions(ct3d);
         address_space_destroy(&ct3d->dc.host_dc_as);
     }
     if (ct3d->hostpmem) {
@@ -1051,6 +1077,110 @@ static void ct3_exit(PCIDevice *pci_dev)
     if (ct3d->hostvmem) {
         address_space_destroy(&ct3d->hostvmem_as);
     }
+}
+
+/*
+ * This function will marked the dpa range [dpa, dap + len) to be backed and
+ * accessible, this happens when a dc extent is added and accepted by the
+ * host.
+ */
+static void set_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
+        uint64_t len)
+{
+    int i;
+    CXLDCD_Region *region = &ct3d->dc.regions[0];
+
+    if (dpa < region->base
+            || dpa >= region->base + ct3d->dc.total_capacity)
+        return;
+
+    /*
+     * spec 3.0 9.13.3: Regions are used in increasing-DPA order, with
+     * Region 0 being used for the lowest DPA of Dynamic Capacity and
+     * Region 7 for the highest DPA.
+     * So we check from the last region to find where the dpa belongs.
+     * access across multiple regions is not allowed.
+     **/
+    for (i = ct3d->dc.num_regions - 1; i >= 0; i--) {
+        region = &ct3d->dc.regions[i];
+        if (dpa >= region->base) {
+            break;
+        }
+    }
+
+    bitmap_set(region->blk_bitmap, (dpa - region->base) / region->block_size,
+            len / region->block_size);
+}
+
+/*
+ * This function check whether a dpa range [dpa, dpa + len) has been backed
+ * with dc extents, used when validating read/write to dc regions
+ */
+static bool test_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
+        uint64_t len)
+{
+    int i;
+    CXLDCD_Region *region = &ct3d->dc.regions[0];
+    uint64_t nbits;
+    long nr;
+
+    if (dpa < region->base
+            || dpa >= region->base + ct3d->dc.total_capacity)
+        return false;
+
+    /*
+     * spec 3.0 9.13.3: Regions are used in increasing-DPA order, with
+     * Region 0 being used for the lowest DPA of Dynamic Capacity and
+     * Region 7 for the highest DPA.
+     * So we check from the last region to find where the dpa belongs.
+     * access across multiple regions is not allowed.
+     */
+    for (i = ct3d->dc.num_regions - 1; i >= 0; i--) {
+        region = &ct3d->dc.regions[i];
+        if (dpa >= region->base) {
+            break;
+        }
+    }
+
+    nr = (dpa - region->base) / region->block_size;
+    nbits = len / region->block_size;
+    return find_next_zero_bit(region->blk_bitmap, nbits, nr) >= nr + nbits;
+}
+
+/*
+ * This function will marked the dpa range [dpa, dap + len) to be unbacked and
+ * inaccessible, this happens when a dc extent is added and accepted by the
+ * host.
+ */
+static void clear_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
+        uint64_t len)
+{
+    int i;
+    CXLDCD_Region *region = &ct3d->dc.regions[0];
+    uint64_t nbits;
+    long nr;
+
+    if (dpa < region->base
+            || dpa >= region->base + ct3d->dc.total_capacity)
+        return;
+
+    /*
+     * spec 3.0 9.13.3: Regions are used in increasing-DPA order, with
+     * Region 0 being used for the lowest DPA of Dynamic Capacity and
+     * Region 7 for the highest DPA.
+     * So we check from the last region to find where the dpa belongs.
+     * access across multiple regions is not allowed.
+     */
+    for (i = ct3d->dc.num_regions - 1; i >= 0; i--) {
+        region = &ct3d->dc.regions[i];
+        if (dpa >= region->base) {
+            break;
+        }
+    }
+
+    nr = (dpa - region->base) / region->block_size;
+    nbits = len / region->block_size;
+    bitmap_clear(region->blk_bitmap, nr, nbits);
 }
 
 static bool cxl_type3_dpa(CXLType3Dev *ct3d, hwaddr host_addr, uint64_t *dpa)
@@ -1145,6 +1275,10 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
         *as = &ct3d->hostpmem_as;
         *dpa_offset -= vmr_size;
     } else {
+        if (!test_region_block_backed(ct3d, *dpa_offset, size)) {
+            return -ENODEV;
+        }
+
         *as = &ct3d->dc.host_dc_as;
         *dpa_offset -= (vmr_size + pmr_size);
     }
@@ -1938,6 +2072,27 @@ static void qmp_cxl_process_dynamic_capacity_event(const char *path,
     }
 
     g_free(extents);
+
+    /* Another choice is to do the set/clear after getting mailbox response*/
+    list = records;
+    while (list) {
+        dpa = list->value->dpa * 1024 * 1024;
+        len = list->value->len * 1024 * 1024;
+        rid = list->value->region_id;
+
+        switch (type) {
+        case DC_EVENT_ADD_CAPACITY:
+            set_region_block_backed(dcd, dpa, len);
+            break;
+        case DC_EVENT_RELEASE_CAPACITY:
+            clear_region_block_backed(dcd, dpa, len);
+            break;
+        default:
+            error_setg(errp, "DC event type not handled yet");
+            break;
+        }
+        list = list->next;
+    }
 }
 
 void qmp_cxl_add_dynamic_capacity_event(const char *path,
