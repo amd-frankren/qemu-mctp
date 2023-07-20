@@ -56,3 +56,9 @@ void qmp_cxl_inject_correctable_error(const char *path, CxlCorErrorType type,
 {
     error_setg(errp, "CXL Type 3 support is not compiled in");
 }
+
+void qmp_cxl_add_dynamic_capacity_event(const char *path,
+        struct CXLDCExtentRecordList  *records, Error **errp) {}
+
+void qmp_cxl_release_dynamic_capacity_event(const char *path,
+        struct CXLDCExtentRecordList  *records, Error **errp) {}

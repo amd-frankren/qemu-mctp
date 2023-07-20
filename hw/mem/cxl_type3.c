@@ -1817,6 +1817,151 @@ void qmp_cxl_inject_memory_module_event(const char *path, CxlEventLog log,
     }
 }
 
+static const QemuUUID dynamic_capacity_uuid = {
+    .data = UUID(0xca95afa7, 0xf183, 0x4018, 0x8c, 0x2f,
+            0x95, 0x26, 0x8e, 0x10, 0x1a, 0x2a),
+};
+
+/*
+ * cxl r3.0: Table 8-47
+ * 00h: add capacity
+ * 01h: release capacity
+ * 02h: forced capacity release
+ * 03h: region configuration updated
+ * 04h: Add capacity response
+ * 05h: capacity released
+ */
+enum DC_Event_Type {
+    DC_EVENT_ADD_CAPACITY,
+    DC_EVENT_RELEASE_CAPACITY,
+    DC_EVENT_FORCED_RELEASE_CAPACITY,
+    DC_EVENT_REGION_CONFIG_UPDATED,
+    DC_EVENT_ADD_CAPACITY_RSP,
+    DC_EVENT_CAPACITY_RELEASED,
+    DC_EVENT_NUM
+};
+
+#define MEM_BLK_SIZE_MB 128
+static void qmp_cxl_process_dynamic_capacity_event(const char *path,
+        CxlEventLog log, enum DC_Event_Type type,
+        uint16_t hid, CXLDCExtentRecordList *records, Error **errp)
+{
+    Object *obj = object_resolve_path(path, NULL);
+    CXLEventDynamicCapacity dCap;
+    CXLEventRecordHdr *hdr = &dCap.hdr;
+    CXLDeviceState *cxlds;
+    CXLType3Dev *dcd;
+    uint8_t flags = 1 << CXL_EVENT_TYPE_INFO;
+    uint32_t num_extents = 0;
+    CXLDCExtentRecordList *list = records;
+    CXLDCExtent_raw *extents;
+    uint64_t dpa, len;
+    uint8_t rid = 0;
+    int i;
+
+    if (!obj) {
+        error_setg(errp, "Unable to resolve path");
+        return;
+    }
+    if (!object_dynamic_cast(obj, TYPE_CXL_TYPE3)) {
+        error_setg(errp, "Path not point to a valid CXL type3 device");
+        return;
+    }
+
+    dcd = CXL_TYPE3(obj);
+    cxlds = &dcd->cxl_dstate;
+    memset(&dCap, 0, sizeof(dCap));
+
+    if (!dcd->dc.num_regions) {
+        error_setg(errp, "No dynamic capacity support from the device");
+        return;
+    }
+
+    while (list) {
+        dpa = list->value->dpa * 1024 * 1024;
+        len = list->value->len * 1024 * 1024;
+        rid = list->value->region_id;
+
+        if (rid >= dcd->dc.num_regions) {
+            error_setg(errp, "region id is too large");
+            return;
+        }
+
+        if (dpa % dcd->dc.regions[rid].block_size
+                || len % dcd->dc.regions[rid].block_size) {
+            error_setg(errp, "dpa or len is not aligned to region block size");
+            return;
+        }
+
+        if (dpa + len > dcd->dc.regions[rid].decode_len * 256 * 1024 * 1024) {
+            error_setg(errp, "extent range is beyond the region end");
+            return;
+        }
+
+        num_extents++;
+        list = list->next;
+    }
+
+    i = 0;
+    list = records;
+    extents = g_new0(CXLDCExtent_raw, num_extents);
+    while (list) {
+        dpa = list->value->dpa * 1024 * 1024;
+        len = list->value->len * 1024 * 1024;
+        rid = list->value->region_id;
+
+        extents[i].start_dpa = dpa + dcd->dc.regions[rid].base;
+        extents[i].len = len;
+        memset(extents[i].tag, 0, 0x10);
+        extents[i].shared_seq = 0;
+
+        list = list->next;
+        i++;
+    }
+
+    /*
+     * 8.2.9.1.5
+     * All Dynamic Capacity event records shall set the Event Record
+     * Severity field in the Common Event Record Format to Informational
+     * Event. All Dynamic Capacity related events shall be logged in the
+     * Dynamic Capacity Event Log.
+     */
+    cxl_assign_event_header(hdr, &dynamic_capacity_uuid, flags, sizeof(dCap),
+            cxl_device_get_timestamp(&dcd->cxl_dstate));
+
+    dCap.type = type;
+    stw_le_p(&dCap.host_id, hid);
+    /* only valid for DC_REGION_CONFIG_UPDATED event */
+    dCap.updated_region_id = rid;
+    for (i = 0; i < num_extents; i++) {
+        memcpy(&dCap.dynamic_capacity_extent, &extents[i]
+                , sizeof(CXLDCExtent_raw));
+
+        if (cxl_event_insert(cxlds, CXL_EVENT_TYPE_DYNAMIC_CAP,
+                    (CXLEventRecordRaw *)&dCap)) {
+            cxl_event_irq_assert(dcd);
+        }
+    }
+
+    g_free(extents);
+}
+
+void qmp_cxl_add_dynamic_capacity_event(const char *path,
+        struct CXLDCExtentRecordList  *records,
+        Error **errp)
+{
+   qmp_cxl_process_dynamic_capacity_event(path, CXL_EVENT_LOG_INFORMATIONAL,
+           DC_EVENT_ADD_CAPACITY, 0, records, errp);
+}
+
+void qmp_cxl_release_dynamic_capacity_event(const char *path,
+        struct CXLDCExtentRecordList  *records,
+        Error **errp)
+{
+    qmp_cxl_process_dynamic_capacity_event(path, CXL_EVENT_LOG_INFORMATIONAL,
+            DC_EVENT_RELEASE_CAPACITY, 0, records, errp);
+}
+
 static void ct3_class_init(ObjectClass *oc, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
