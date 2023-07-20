@@ -84,6 +84,8 @@ enum {
     DCD_CONFIG  = 0x48, /*r3.0: 8.2.9.8.9*/
         #define GET_DC_CONFIG          0x0
         #define GET_DYN_CAP_EXT_LIST   0x1
+        #define ADD_DYN_CAP_RSP        0x2
+        #define RELEASE_DYN_CAP        0x3
     PHYSICAL_SWITCH = 0x51
         #define IDENTIFY_SWITCH_DEVICE      0x0
 };
@@ -1086,6 +1088,251 @@ static CXLRetCode cmd_dcd_get_dyn_cap_ext_list(struct cxl_cmd *cmd,
     return CXL_MBOX_SUCCESS;
 }
 
+/*
+ * Check whether the bits at addr between [nr, nr+size) are all set,
+ * return 1 if all 1s, else return 0
+ */
+static inline int test_bits(const unsigned long *addr, int nr, int size)
+{
+    unsigned long res = find_next_zero_bit(addr, size + nr, nr);
+
+    return (res >= nr + size) ? 1 : 0;
+}
+
+/*
+ * Find dynamic capacity region id based on dpa range [dpa, dpa+len)
+ */
+static uint8_t find_region_id(struct CXLType3Dev *dev, uint64_t dpa,
+        uint64_t len)
+{
+    int8_t i = dev->dc.num_regions - 1;
+
+    while (i > 0 && dpa < dev->dc.regions[i].base) {
+        i--;
+    }
+
+    if (dpa < dev->dc.regions[i].base
+            || dpa + len > dev->dc.regions[i].base + dev->dc.regions[i].len) {
+        return dev->dc.num_regions;
+    }
+
+    return i;
+}
+
+static void insert_extent_to_extent_list(CXLDCDExtentList *list, uint64_t dpa,
+        uint64_t len, uint8_t *tag, uint16_t shared_seq)
+{
+    CXLDCD_Extent *extent;
+    extent = g_new0(CXLDCD_Extent, 1);
+    extent->start_dpa = dpa;
+    extent->len = len;
+    if (tag) {
+        memcpy(extent->tag, tag, 0x10);
+    } else {
+        memset(extent->tag, 0, 0x10);
+    }
+    extent->shared_seq = shared_seq;
+
+    QTAILQ_INSERT_TAIL(list, extent, node);
+}
+
+typedef struct updated_dc_extent_list_in_pl {
+    uint32_t num_entries_updated;
+    uint8_t rsvd[4];
+    struct { /* r3.0: Table 8-130 */
+        uint64_t start_dpa;
+        uint64_t len;
+        uint8_t rsvd[8];
+    } QEMU_PACKED updated_entries[];
+} QEMU_PACKED updated_dc_extent_list_in_pl;
+
+/*
+ * The function only check the input extent list against itself.
+ */
+static CXLRetCode detect_malformed_extent_list(CXLType3Dev *dev,
+        const updated_dc_extent_list_in_pl *in)
+{
+    unsigned long *blk_bitmap;
+    uint64_t min_block_size = dev->dc.regions[0].block_size;
+    struct CXLDCD_Region *region = &dev->dc.regions[0];
+    uint32_t i;
+    uint64_t dpa, len;
+    uint8_t rid;
+    CXLRetCode ret;
+
+    for (i = 1; i < dev->dc.num_regions; i++) {
+        region = &dev->dc.regions[i];
+        if (min_block_size > region->block_size) {
+            min_block_size = region->block_size;
+        }
+    }
+
+    blk_bitmap = bitmap_new((region->len + region->base
+                - dev->dc.regions[0].base) / min_block_size);
+
+    for (i = 0; i < in->num_entries_updated; i++) {
+        dpa = in->updated_entries[i].start_dpa;
+        len = in->updated_entries[i].len;
+
+        rid = find_region_id(dev, dpa, len);
+        if (rid == dev->dc.num_regions) {
+            ret = CXL_MBOX_INVALID_PA;
+            goto out;
+        }
+
+        region = &dev->dc.regions[rid];
+        if (dpa % region->block_size || len % region->block_size) {
+            ret = CXL_MBOX_INVALID_EXTENT_LIST;
+            goto out;
+        }
+        /* the dpa range already covered by some other extents in the list */
+        if (test_bits(blk_bitmap, dpa / min_block_size, len / min_block_size)) {
+            ret = CXL_MBOX_INVALID_EXTENT_LIST;
+            goto out;
+        }
+        bitmap_set(blk_bitmap, dpa / min_block_size, len / min_block_size);
+   }
+
+    ret = CXL_MBOX_SUCCESS;
+
+out:
+    g_free(blk_bitmap);
+    return ret;
+}
+
+/*
+ * cxl spec 3.0: 8.2.9.8.9.3
+ * Add Dynamic Capacity Response (opcode 4802h)
+ * Assume an extent is added only after the response is processed successfully
+ * TODO: for better extent list validation, a better solution would be
+ * maintaining a pending extent list and use it to verify the extent list in
+ * the response.
+ */
+static CXLRetCode cmd_dcd_add_dyn_cap_rsp(struct cxl_cmd *cmd,
+        CXLDeviceState *cxl_dstate, uint16_t *len_unused)
+{
+    updated_dc_extent_list_in_pl *in = (void *)cmd->payload;
+    struct CXLType3Dev *ct3d = container_of(cxl_dstate, CXLType3Dev,
+            cxl_dstate);
+    CXLDCDExtentList *extent_list = &ct3d->dc.extents;
+    CXLDCD_Extent *ent;
+    uint32_t i;
+    uint64_t dpa, len;
+    CXLRetCode ret;
+ 
+    if (in->num_entries_updated == 0) {
+        ret = CXL_MBOX_SUCCESS;
+        goto out;
+    }
+
+    ret = detect_malformed_extent_list(ct3d, in);
+    if (ret != CXL_MBOX_SUCCESS) {
+        goto out;
+    }
+
+    for (i = 0; i < in->num_entries_updated; i++) {
+        dpa = in->updated_entries[i].start_dpa;
+        len = in->updated_entries[i].len;
+
+        /*
+         * Check if the DPA range of the to-be-added extent overlaps with
+         * existing extent list maintained by the device.
+         */
+        QTAILQ_FOREACH(ent, extent_list, node) {
+            if (ent->start_dpa == dpa && ent->len == len) {
+                ret = CXL_MBOX_INVALID_PA;
+                goto out;
+            } else if (ent->start_dpa <= dpa
+                    && dpa + len <= ent->start_dpa + ent->len) {
+                ret = CXL_MBOX_INVALID_PA;
+                goto out;
+            } else if ((dpa < ent->start_dpa + ent->len
+                        && dpa + len > ent->start_dpa + ent->len)
+                    || (dpa < ent->start_dpa && dpa + len > ent->start_dpa)) {
+                ret = CXL_MBOX_INVALID_PA;
+                goto out;
+            }
+        }
+
+        /*
+         * TODO: add a pending extent list based on event log record and verify
+         * the input response
+         */
+
+        insert_extent_to_extent_list(extent_list, dpa, len, NULL, 0);
+    }
+    ret = CXL_MBOX_SUCCESS;
+
+out:
+    return ret;
+}
+
+/*
+ * Spec 3.0: 8.2.9.8.9.4
+ * Release Dynamic Capacity (opcode 4803h)
+ **/
+static CXLRetCode cmd_dcd_release_dyn_cap(struct cxl_cmd *cmd,
+        CXLDeviceState *cxl_dstate,
+        uint16_t *len_unused)
+{
+    updated_dc_extent_list_in_pl *in = (void *)cmd->payload;
+    struct CXLType3Dev *ct3d = container_of(cxl_dstate, CXLType3Dev,
+            cxl_dstate);
+    CXLDCDExtentList *extent_list = &ct3d->dc.extents;
+    CXLDCD_Extent *ent;
+    uint32_t i;
+    uint64_t dpa, len;
+    CXLRetCode ret;
+
+    if (in->num_entries_updated == 0) {
+        return CXL_MBOX_INVALID_INPUT;
+    }
+
+    ret = detect_malformed_extent_list(ct3d, in);
+    if (ret != CXL_MBOX_SUCCESS) {
+        return ret;
+    }
+
+    for (i = 0; i < in->num_entries_updated; i++) {
+        dpa = in->updated_entries[i].start_dpa;
+        len = in->updated_entries[i].len;
+
+        QTAILQ_FOREACH(ent, extent_list, node) {
+            if (ent->start_dpa == dpa && ent->len == len) {
+                break;
+            } else if (ent->start_dpa < dpa
+                    && dpa + len <= ent->start_dpa + ent->len) {
+                /* remove partial extent */
+                uint64_t len1 = dpa - ent->start_dpa;
+                uint64_t len2 = ent->start_dpa + ent->len - dpa - len;
+
+                if (len1) {
+                    insert_extent_to_extent_list(extent_list, ent->start_dpa,
+                            len1, NULL, 0);
+                }
+                if (len2) {
+                    insert_extent_to_extent_list(extent_list, dpa + len, len2,
+                            NULL, 0);
+                }
+                break;
+            } else if ((dpa < ent->start_dpa + ent->len
+                        && dpa + len > ent->start_dpa + ent->len)
+                    || (dpa < ent->start_dpa && dpa + len > ent->start_dpa))
+                return CXL_MBOX_INVALID_EXTENT_LIST;
+        }
+
+        if (ent) {
+            QTAILQ_REMOVE(extent_list, ent, node);
+            g_free(ent);
+        } else {
+            /* Try to remove a non-existing extent */
+            return CXL_MBOX_INVALID_PA;
+        }
+    }
+
+    return CXL_MBOX_SUCCESS;
+}
+ 
 #define IMMEDIATE_CONFIG_CHANGE (1 << 1)
 #define IMMEDIATE_DATA_CHANGE (1 << 2)
 #define IMMEDIATE_POLICY_CHANGE (1 << 3)
@@ -1129,6 +1376,12 @@ static struct cxl_cmd cxl_cmd_set[256][256] = {
     [DCD_CONFIG][GET_DYN_CAP_EXT_LIST] = {
         "DCD_GET_DYNAMIC_CAPACITY_EXTENT_LIST", cmd_dcd_get_dyn_cap_ext_list,
         8, 0 },
+    [DCD_CONFIG][ADD_DYN_CAP_RSP] = {
+        "ADD_DCD_DYNAMIC_CAPACITY_RESPONSE", cmd_dcd_add_dyn_cap_rsp,
+        ~0, IMMEDIATE_DATA_CHANGE },
+    [DCD_CONFIG][RELEASE_DYN_CAP] = {
+        "RELEASE_DCD_DYNAMIC_CAPACITY", cmd_dcd_release_dyn_cap,
+        ~0, IMMEDIATE_DATA_CHANGE },
 };
 
 static struct cxl_cmd cxl_cmd_set_sw[256][256] = {
