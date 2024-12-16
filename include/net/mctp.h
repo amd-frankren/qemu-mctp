@@ -10,6 +10,7 @@ enum {
 
 enum {
     MCTP_MESSAGE_TYPE_CONTROL   = 0x0,
+    MCTP_MESSAGE_TYPE_PLDM      = 0x1,
     MCTP_MESSAGE_TYPE_NMI       = 0x4,
 
     MCTP_MESSAGE_IC             = 1 << 7,

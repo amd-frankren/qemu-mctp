@@ -1,0 +1,5 @@
+i2c_ss = ss.source_set()
+i2c_ss.add(when: 'CONFIG_MCTP_I2C', if_true: files('pldm.c'))
+i2c_ss.add(when: 'CONFIG_MCTP_I2C', if_true: files('pldm_base.c'))
+i2c_ss.add(when: 'CONFIG_MCTP_I2C', if_true: files('pldm_platform.c'))
+softmmu_ss.add_all(when: 'CONFIG_I2C', if_true: i2c_ss)
